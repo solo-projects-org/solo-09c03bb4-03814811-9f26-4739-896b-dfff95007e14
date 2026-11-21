@@ -55,6 +55,38 @@ CREATE TABLE IF NOT EXISTS publication_details (
 );
 
 CREATE INDEX IF NOT EXISTS idx_publications_period ON publications(province, month, id);
+
+-- 每个 省份+月份 只保留一条「最新发布」索引，供已发布列表直接查询。
+CREATE TABLE IF NOT EXISTS published_latest (
+    province        TEXT NOT NULL,
+    month           TEXT NOT NULL,
+    publication_id  INTEGER NOT NULL REFERENCES publications(id),
+    preview_id      INTEGER NOT NULL,
+    total_kwh       REAL NOT NULL,
+    total_emissions REAL NOT NULL,
+    published_at    TEXT NOT NULL,
+    indexed_at      TEXT NOT NULL,
+    PRIMARY KEY (province, month)
+);
+
+CREATE INDEX IF NOT EXISTS idx_published_latest_pub ON published_latest(publication_id);
+
+-- 分批补建进度：cursor 是最后一个已完成批次的 (province, month)；
+-- total_periods 是开始补建时的历史期数快照，done_periods 已补建期数；
+-- completed=1 表示历史发布已全部进入索引。
+CREATE TABLE IF NOT EXISTS published_index_state (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    cursor_province TEXT NOT NULL DEFAULT '',
+    cursor_month    TEXT NOT NULL DEFAULT '',
+    done_periods    INTEGER NOT NULL DEFAULT 0,
+    total_periods   INTEGER NOT NULL DEFAULT 0,
+    completed       INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT NOT NULL DEFAULT ''
+);
+
+INSERT OR IGNORE INTO published_index_state
+    (id, cursor_province, cursor_month, done_periods, total_periods, completed, updated_at)
+VALUES (1, '', '', 0, 0, 0, '');
 """
 
 

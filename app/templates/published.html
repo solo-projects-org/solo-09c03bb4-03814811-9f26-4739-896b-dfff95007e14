@@ -14,7 +14,18 @@
 </div>
 <div class="card">
   <h2>全部已发布期次</h2>
+  <p class="muted" id="indexNote"></p>
   <div id="list"></div>
+</div>
+<div class="card">
+  <h2>最新发布索引补建</h2>
+  <p class="muted">列表建齐后只读每省月一行的最新发布索引。补建未完成时列表仍按发布号取各期最新，可正常查询；补建按批次推进，期间可继续发布，中断后从已完成批次继续。</p>
+  <div class="row">
+    <div class="field"><label>每批期数</label><input type="number" id="batchSize" min="1" max="1000" value="50"></div>
+    <button class="ghost" onclick="buildBatch()">补建一批</button>
+  </div>
+  <div id="indexMsg" class="msg"></div>
+  <div id="indexStatus"></div>
 </div>
 <script>
 const srcName = s => s === 'province' ? '省级' : '全国';
@@ -36,6 +47,37 @@ async function loadList() {
     d.rows.map(r => `<tr><td>${r.province}</td><td>${r.month}</td><td class="num">${r.total_kwh}</td>
       <td class="num">${r.total_emissions}</td><td>${r.published_at}</td></tr>`).join('') + '</table>';
 }
-loadList();
+let indexPolls = 0;
+async function loadIndexStatus() {
+  const s = await (await fetch('/api/published/index/status')).json();
+  const done = s.completed ? s.indexed_periods : s.backfilled_periods;
+  const pct = s.total_periods ? Math.round(done * 100 / s.total_periods) : 100;
+  indexStatus.innerHTML = `<p class="muted">状态：${s.completed ? '已建齐（列表走索引）' : '补建中（列表走即时聚合）'}；
+    已补建 ${done} / ${s.total_periods} 期（${pct}%）；索引共 ${s.indexed_periods} 期；每批 ${s.batch_size} 期；最后更新 ${s.updated_at || '—'}</p>`;
+  indexNote.textContent = s.completed
+    ? '列表当前查询「每省月最新发布索引」。'
+    : `索引补建中（已补建 ${done}/${s.total_periods} 期），列表当前按发布号即时取各期最新，结果与建齐后一致。`;
+  // 未建齐时定时刷新进度（限次，避免页面长时间空转）
+  if (!s.completed && indexPolls < 60) {
+    indexPolls += 1;
+    setTimeout(refreshAll, 2000);
+  }
+  return s;
+}
+async function refreshAll() {
+  await loadIndexStatus();
+  await loadList();
+}
+async function buildBatch() {
+  const body = {batch_size: +batchSize.value || 50};
+  const r = await fetch('/api/published/index/backfill', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if (!r.ok) { indexMsg.className='msg err'; indexMsg.textContent = typeof d.detail === 'string' ? d.detail : '补建失败'; return; }
+  indexMsg.className='msg ok';
+  indexMsg.textContent = d.completed ? '索引已建齐。' : `本批完成 ${d.processed} 期，可继续补建。`;
+  indexPolls = 0;
+  await refreshAll();
+}
+refreshAll();
 </script>
 {% endblock %}

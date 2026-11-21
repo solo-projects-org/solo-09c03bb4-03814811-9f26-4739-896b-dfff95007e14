@@ -16,6 +16,35 @@ from fastapi import HTTPException
 
 MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 EMISSIONS_DIGITS = 6  # kg CO2 保留小数位，保证快照可稳定比对
+INDEX_BATCH_SIZE = 50  # 每批补建的期数，可在页面/接口调整
+
+# 索引建齐后列表只读「每省月一行的最新发布索引」，不再扫描历次发布。
+LIST_INDEXED_SQL = (
+    "SELECT province, month, publication_id AS id, preview_id,"
+    " total_kwh, total_emissions, published_at"
+    " FROM published_latest ORDER BY month DESC, province"
+)
+
+# 补建未完成时列表仍按发布号取每期最新：单条语句、单一读取快照，保证各期版本一致。
+LIST_FALLBACK_SQL = (
+    "SELECT p.province, p.month, p.id, p.preview_id, p.total_kwh,"
+    " p.total_emissions, p.published_at"
+    " FROM publications p"
+    " JOIN (SELECT province, month, MAX(id) AS max_id FROM publications"
+    "       GROUP BY province, month) t ON p.id = t.max_id"
+    " ORDER BY p.month DESC, p.province"
+)
+
+INDEX_UPSERT_SQL = (
+    "INSERT INTO published_latest"
+    "(province, month, publication_id, preview_id, total_kwh, total_emissions, published_at, indexed_at)"
+    " VALUES (?,?,?,?,?,?,?,?)"
+    " ON CONFLICT(province, month) DO UPDATE SET"
+    "   publication_id=excluded.publication_id, preview_id=excluded.preview_id,"
+    "   total_kwh=excluded.total_kwh, total_emissions=excluded.total_emissions,"
+    "   published_at=excluded.published_at, indexed_at=excluded.indexed_at"
+    " WHERE excluded.publication_id > published_latest.publication_id"
+)
 
 
 def now_iso() -> str:
@@ -241,6 +270,13 @@ def publish(conn: Connection, preview_id: int) -> dict:
             [(pub_id, d["meter_no"], d["kwh"], d["factor_source"],
               d["factor_value"], d["factor_year"], d["emissions"]) for d in current["details"]],
         )
+        # 同一事务内推进该期最新发布索引；与发布一起提交或一起回滚。
+        # 索引只允许发布号更大者覆盖：补建期间并发改发绝不会被旧版本盖回。
+        conn.execute(
+            INDEX_UPSERT_SQL,
+            (current["province"], current["month"], pub_id, preview_id,
+             current["total_kwh"], current["total_emissions"], now_iso(), now_iso()),
+        )
     return {"publication_id": pub_id, **current}
 
 
@@ -260,10 +296,144 @@ def latest_publication(conn: Connection, province: str, month: str) -> dict | No
 
 
 def list_publications(conn: Connection) -> list[dict]:
-    """每个 省+月 的最新一条发布。"""
-    rows = conn.execute(
-        "SELECT p.* FROM publications p"
-        " JOIN (SELECT province, month, MAX(id) AS max_id FROM publications GROUP BY province, month) t"
-        " ON p.id = t.max_id ORDER BY p.month DESC, p.province"
-    ).fetchall()
-    return [dict(r) for r in rows]
+    """每个 省+月 的最新一条发布。
+
+    索引建齐后只读 published_latest；补建期间退回 publications 的即时聚合。
+    两条语句包在同一个只读事务里：各期版本取自同一已提交状态，
+    不会出现「部分期次来自索引、部分期次来自旧表」的混合结果。
+    """
+    owned = not conn.in_transaction
+    if owned:
+        conn.execute("BEGIN")
+    try:
+        row = conn.execute(
+            "SELECT completed FROM published_index_state WHERE id=1"
+        ).fetchone()
+        sql = LIST_INDEXED_SQL if row and row["completed"] else LIST_FALLBACK_SQL
+        rows = [dict(r) for r in conn.execute(sql)]
+    except Exception:
+        if owned:
+            conn.rollback()
+        raise
+    if owned:
+        conn.commit()
+    return rows
+
+
+# ---------- 最新发布索引：分批补建 ----------
+
+def _period_count(conn: Connection) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT province, month FROM publications)"
+    ).fetchone()[0]
+
+
+def index_status(conn: Connection) -> dict:
+    state = conn.execute(
+        "SELECT cursor_province, cursor_month, done_periods, total_periods, completed, updated_at"
+        " FROM published_index_state WHERE id=1"
+    ).fetchone()
+    if state is None:  # 兜底：状态行缺失时视为未建齐、从头开始
+        state = {"cursor_province": "", "cursor_month": "", "done_periods": 0,
+                 "total_periods": 0, "completed": 0, "updated_at": ""}
+    indexed = conn.execute("SELECT COUNT(*) FROM published_latest").fetchone()[0]
+    completed = bool(state["completed"])
+    # 开始补建后以首批快照的历史期数为进度分母，补建期间新发布的期不干扰进度判定。
+    total = state["total_periods"] or indexed
+    if completed:
+        # 建齐后仍有新期次发布：进度以当前索引期数为准
+        total = max(total, indexed)
+    return {
+        "completed": completed,
+        "list_source": "index" if completed else "live",
+        "cursor_province": state["cursor_province"],
+        "cursor_month": state["cursor_month"],
+        "total_periods": total,
+        "backfilled_periods": state["done_periods"],
+        "indexed_periods": indexed,
+        "remaining_periods": max(0, total - indexed) if completed else max(0, total - state["done_periods"]),
+        "batch_size": INDEX_BATCH_SIZE,
+        "updated_at": state["updated_at"],
+    }
+
+
+def backfill_index_batch(conn: Connection, batch_size: int = INDEX_BATCH_SIZE) -> dict:
+    """补建一批历史发布索引，返回本批处理情况与最新进度。
+
+    每批一个写事务：写完索引行与游标后一起提交；中断时整批回滚，
+    重启后从上一个已提交批次的游标继续。游标按 (province, month) 稳定排序。
+    首批开始时对历史期数取快照，补建期间新发布的期不干扰进度判定。
+    索引写入只允许发布号更大者覆盖，因此补建期间发生的改发不会被旧版本盖回。
+    """
+    if not (1 <= batch_size <= 1000):
+        raise HTTPException(422, "每批期数须在 1 到 1000 之间")
+
+    try:
+        # 写锁在批开始时取得，批内不会被其他写者穿插。
+        conn.execute("BEGIN IMMEDIATE")
+    except Exception:
+        conn.rollback()
+        raise
+    try:
+        state = conn.execute(
+            "SELECT cursor_province, cursor_month, done_periods, total_periods, completed"
+            " FROM published_index_state WHERE id=1"
+        ).fetchone()
+        if state is None:
+            conn.execute(
+                "INSERT INTO published_index_state"
+                " (id, cursor_province, cursor_month, done_periods, total_periods, completed, updated_at)"
+                " VALUES (1,'','',0,0,0,'')"
+            )
+            state = {"cursor_province": "", "cursor_month": "", "done_periods": 0,
+                     "total_periods": 0, "completed": 0}
+        if state["completed"]:
+            conn.commit()
+            return {"processed": 0, "completed_now": True, **index_status(conn)}
+
+        total = state["total_periods"]
+        if not total:
+            total = _period_count(conn)
+
+        periods = conn.execute(
+            "SELECT province, month FROM publications"
+            " WHERE province > ? OR (province = ? AND month > ?)"
+            " GROUP BY province, month"
+            " ORDER BY province, month LIMIT ?",
+            (state["cursor_province"], state["cursor_province"],
+             state["cursor_month"], batch_size),
+        ).fetchall()
+
+        if not periods:
+            conn.execute(
+                "UPDATE published_index_state"
+                " SET completed=1, total_periods=?, updated_at=? WHERE id=1",
+                (total, now_iso()),
+            )
+            conn.commit()
+            return {"processed": 0, "completed_now": True, **index_status(conn)}
+
+        ts = now_iso()
+        for p in periods:
+            row = conn.execute(
+                "SELECT id, province, month, preview_id, total_kwh, total_emissions, published_at"
+                " FROM publications WHERE province=? AND month=? ORDER BY id DESC LIMIT 1",
+                (p["province"], p["month"]),
+            ).fetchone()
+            conn.execute(
+                INDEX_UPSERT_SQL,
+                (row["province"], row["month"], row["id"], row["preview_id"],
+                 row["total_kwh"], row["total_emissions"], row["published_at"], ts),
+            )
+        last = periods[-1]
+        conn.execute(
+            "UPDATE published_index_state"
+            " SET cursor_province=?, cursor_month=?, done_periods=done_periods+?,"
+            "     total_periods=?, updated_at=? WHERE id=1",
+            (last["province"], last["month"], len(periods), total, ts),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"processed": len(periods), "completed_now": False, **index_status(conn)}

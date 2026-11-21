@@ -1,7 +1,10 @@
 """FastAPI 入口：网页 + JSON API。"""
 import csv
 import io
-from contextlib import asynccontextmanager
+import os
+import threading
+import time
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
@@ -30,7 +33,41 @@ HEADER_ALIASES = {
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
-    yield
+    stop = threading.Event()
+    worker = None
+    # 启动时若历史索引尚未建齐，后台分批续建（页面亦可手动触发）。
+    if os.environ.get("AUTO_BACKFILL", "1") != "0":
+        with closing(get_conn()) as conn:
+            need_backfill = not services.index_status(conn)["completed"]
+        if need_backfill:
+            worker = threading.Thread(target=_auto_backfill, args=(stop,), daemon=True)
+            worker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        if worker:
+            worker.join(timeout=10)
+
+
+def _auto_backfill(stop: threading.Event) -> None:
+    """后台分批补建；每次重新取连接，随时可被中断，重启后由游标续建。"""
+    try:
+        batch_size = int(os.environ.get("BACKFILL_BATCH_SIZE", services.INDEX_BATCH_SIZE))
+    except ValueError:
+        batch_size = services.INDEX_BATCH_SIZE
+    batch_size = max(1, min(1000, batch_size))
+    while not stop.is_set():
+        try:
+            with closing(get_conn()) as conn:
+                result = services.backfill_index_batch(conn, batch_size)
+        except Exception:
+            # 单批失败（如数据库忙）：整批已回滚，稍后从同一游标重试。
+            stop.wait(2)
+            continue
+        if result["completed"]:
+            return
+        time.sleep(0.05)
 
 
 app = FastAPI(title="集团购电碳排放盘查发布", lifespan=lifespan)
@@ -190,3 +227,20 @@ def api_published(province: str, month: str):
 def api_published_list():
     with get_conn() as conn:
         return {"rows": services.list_publications(conn)}
+
+
+@app.get("/api/published/index/status")
+def api_index_status():
+    with get_conn() as conn:
+        return services.index_status(conn)
+
+
+class IndexBackfillIn(BaseModel):
+    batch_size: int = services.INDEX_BATCH_SIZE
+
+
+@app.post("/api/published/index/backfill")
+def api_index_backfill(body: IndexBackfillIn | None = None):
+    size = body.batch_size if body else services.INDEX_BATCH_SIZE
+    with get_conn() as conn:
+        return services.backfill_index_batch(conn, size)

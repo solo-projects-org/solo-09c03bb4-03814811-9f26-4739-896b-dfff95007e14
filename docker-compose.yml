@@ -5,6 +5,9 @@ services:
       - "8000:8000"
     environment:
       APP_DB: /data/app.db
+      # 启动时自动在后台分批补建最新发布索引；设为 0 可只通过页面/接口手动补建。
+      AUTO_BACKFILL: "1"
+      BACKFILL_BATCH_SIZE: "50"
     volumes:
       - carbon-data:/data
     restart: unless-stopped
